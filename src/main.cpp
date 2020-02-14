@@ -13,6 +13,8 @@
 
 #include "shader.h"
 
+// https://observablehq.com/@daxreincarnate/primordial-particle-system#moveParticles
+
 // Data that will be associated with the GLFW window
 struct InputData
 {
@@ -20,8 +22,8 @@ struct InputData
 };
 
 // Viewport and camera settings
-const uint32_t window_w = 800;
-const uint32_t window_h = 800;
+const uint32_t window_w = 750;
+const uint32_t window_h = 750;
 bool first_mouse = true;
 float last_x;
 float last_y;
@@ -30,7 +32,8 @@ glm::mat4 arcball_camera_matrix = glm::lookAt(glm::vec3{ 0.0f, 0.0f, 4.0f }, glm
 glm::mat4 arcball_model_matrix = glm::mat4{ 1.0f };
 
 // Global settings
-// ...
+bool show_ui = true;
+float draw_radius = 6.0;
 
 // Appearance settings
 ImVec4 clear_color = ImVec4(0.66f, 0.64f, 0.66f, 1.0f);
@@ -71,6 +74,10 @@ void key_callback(GLFWwindow* window, int key, int scancode, int action, int mod
         // Reset the arcball camera
         arcball_camera_matrix = glm::lookAt(glm::vec3{ 6.0f, 0.0f, 0.0f }, glm::vec3{ 0.0f }, glm::vec3{ 1.0f, 1.0f, 0.0f });
         arcball_model_matrix = glm::mat4{ 1.0f };
+    }
+    if (key == GLFW_KEY_U && action == GLFW_PRESS)
+    {
+        show_ui = !show_ui;
     }
 }
 
@@ -199,11 +206,14 @@ struct Bounds
     glm::vec2 max;
 };
 
-struct Particle
+struct alignas(8) Particle
 {
     glm::vec2 position;
     float phi;
     float n;
+    float l;
+    float r;
+    float bin_index;
 
     glm::vec2 get_heading() const
     {
@@ -214,9 +224,9 @@ struct Particle
 struct Params
 {
     float alpha = 0.1f;
-    float beta = 0.5f;
-    float radius = 0.05f;
-    float speed = 0.0015f;
+    float beta = 0.125f;
+    float radius = 30.0f;
+    float speed = 50.0f;
 };
 
 /*
@@ -229,21 +239,28 @@ template <typename T> int sign(T val)
     return (T(0) < val) - (val < T(0));
 }
 
+const size_t count = 5000;
+
 class System
 {
 
 public:
 
-    System(const Bounds& bounds, size_t number_of_particles = 2000) :
-        bounds{ bounds }
+    System(const Bounds& bounds, int32_t k = 4) :
+        bounds{ bounds },
+        k{ k }
     {
-        std::default_random_engine generator;
-        std::uniform_real_distribution<float> distribution(0.0f, glm::pi<float>() * 2.0f);
+        reset();
 
-        for (size_t i = 0; i < number_of_particles; ++i)
-        {
-            particles.push_back(Particle{ glm::diskRand(0.5f) + 0.5f, distribution(generator) });
-        }
+        bin_size = 1 << k;
+       // bin_size = 50;
+        x_bins = static_cast<uint32_t>(ceilf((float)window_w / (float)bin_size));
+        y_bins = static_cast<uint32_t>(ceilf((float)window_h / (float)bin_size));
+        bins.resize(x_bins * y_bins);
+
+        std::cout << "Bin size: " << bin_size << "\n";
+        std::cout << "X bins: " << x_bins << "\n";
+        std::cout << "Y bins: " << y_bins << "\n";
 
         initialize();
     }
@@ -251,6 +268,24 @@ public:
     void set_params(const Params& updated)
     {
         params = updated;
+    }
+
+    void reset()
+    {
+        particles.clear();
+
+        std::default_random_engine generator;
+        std::uniform_real_distribution<float> distribution(0.0f, glm::pi<float>() * 2.0f);
+
+        float max_dimension = std::max(window_w, window_h);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            particles.push_back(Particle{
+                glm::diskRand(max_dimension * 0.25f) + glm::vec2{window_w, window_h} * 0.5f,
+                distribution(generator)
+            });
+        }
     }
 
     void initialize()
@@ -263,83 +298,192 @@ public:
         {
             glVertexArrayVertexBuffer(vao, 0, vbo, 0, sizeof(Particle));
 
+            // Enable vertex attributes
             glEnableVertexArrayAttrib(vao, 0);
             glEnableVertexArrayAttrib(vao, 1);
             glEnableVertexArrayAttrib(vao, 2);
+            glEnableVertexArrayAttrib(vao, 3);
 
+            // Set vertex attribute formats
             glVertexArrayAttribFormat(vao, 0, 2, GL_FLOAT, GL_FALSE, offsetof(Particle, position));
             glVertexArrayAttribFormat(vao, 1, 1, GL_FLOAT, GL_FALSE, offsetof(Particle, phi));
             glVertexArrayAttribFormat(vao, 2, 1, GL_FLOAT, GL_FALSE, offsetof(Particle, n));
+            glVertexArrayAttribFormat(vao, 3, 1, GL_FLOAT, GL_FALSE, offsetof(Particle, bin_index));
 
+            // Associate buffers with vertex attributes
             glVertexArrayAttribBinding(vao, 0, 0);
             glVertexArrayAttribBinding(vao, 1, 0);
             glVertexArrayAttribBinding(vao, 2, 0);
+            glVertexArrayAttribBinding(vao, 3, 0);
         }
+    }
+
+    std::vector<Particle*> get_neighbors(const Particle& particle, float radius) 
+    {
+        std::vector<Particle*> region = get_region(
+            static_cast<uint32_t>(particle.position.x - radius),
+            static_cast<uint32_t>(particle.position.y - radius),
+            static_cast<uint32_t>(particle.position.x + radius),
+            static_cast<uint32_t>(particle.position.y + radius));
+
+        std::vector<Particle*> neighbors;
+
+        const float radius_squared = radius * radius;
+
+        for (size_t i = 0; i < region.size(); ++i)
+        {
+            const Particle& current = *region[i];
+
+            float delta_x = current.position.x - particle.position.x;
+            float delta_y = current.position.y - particle.position.y;
+            float distance_squared = delta_x * delta_x + delta_y * delta_y;
+
+            if (distance_squared < radius_squared)
+            {
+                neighbors.push_back(region[i]);
+            }
+        }
+
+        return neighbors;
+    }
+
+    std::vector<Particle*> get_region(uint32_t minX, uint32_t minY, uint32_t maxX, uint32_t maxY)
+    {
+        std::vector<Particle*> region;
+        auto back = back_inserter(region);
+
+        uint32_t min_x_bin = minX >> k;
+        uint32_t max_x_bin = maxX >> k;
+        uint32_t min_y_bin = minY >> k;
+        uint32_t max_y_bin = maxY >> k;
+
+        max_x_bin++;
+        max_y_bin++;
+
+        if (max_x_bin > x_bins)
+        {
+            max_x_bin = x_bins;
+        }
+        if (max_y_bin > y_bins)
+        {
+            max_y_bin = y_bins;
+        }
+
+        for (size_t y = min_y_bin; y < max_y_bin; ++y) 
+        {
+            for (size_t x = min_x_bin; x < max_x_bin; ++x)
+            {
+                std::vector<Particle*>& current = bins[y * x_bins + x];
+                copy(current.begin(), current.end(), back);
+            }
+        }
+
+        return region;
     }
 
     void update()
     {
+        calculate_bins();
+        step();
+    }
+
+    void calculate_bins()
+    {
+        for (auto& bin : bins)
+        {
+            bin.clear();
+        }
+
+        for (auto& particle : particles)
+        {
+            //auto bin_indices = glm::uvec2(particle.position) >> glm::uvec2{ k };
+
+            const uint32_t x_bin = static_cast<uint32_t>(particle.position.x) >> k;
+            const uint32_t y_bin = static_cast<uint32_t>(particle.position.y) >> k;
+            const uint32_t bin_index = y_bin * x_bins + x_bin;
+
+            particle.bin_index = bin_index;
+
+            if (x_bin < x_bins && y_bin < y_bins)
+            {
+                bins[bin_index].push_back(&particle);
+            }
+        }
+    }
+
+    void step()
+    {
         int32_t n_max = 0;
 
-        for (size_t i = 0; i < particles.size(); ++i)
-        {
+        for (auto& particle: particles)
+        {   
+            // Keep track of the number of left and right neighbors of `particle`
             int32_t l = 0;
             int32_t r = 0;
 
-            for (size_t j = 0; j < particles.size(); ++j)
+            // Get all neighbors of `particle`, i.e. the particles that reside in bins that are
+            // less than `param.radius` units away
+            auto neighbors = get_neighbors(particle, params.radius);
+
+            for (const auto& other : neighbors)
             {
-                if (i != j)
+                if (other->position == particle.position)
                 {
-                    if (glm::distance(particles[j].position, particles[i].position) < params.radius)
-                    {
-                        auto a = particles[j].position - particles[i].position;
-                        auto b = particles[i].get_heading();
+                    continue;
+                }
+                
+                // Determine which side of `particle` this neighbor lies on using the cross product
+                const auto a = other->position - particle.position;
+                const auto b = particle.get_heading();
+                const auto c = glm::cross(glm::vec3{ b, 0.0f }, glm::vec3{ a, 0.0f });
 
-                        auto c = glm::cross(glm::vec3{ b, 0.0f }, glm::vec3{ a, 0.0f });
-
-                        if (c.z >= 0.0f)
-                        {
-                            l++;
-                        }
-                        else
-                        {
-                            r++;
-                        }
-                    }
-
+                if (c.z >= 0.0f)
+                {
+                    l++;
+                }
+                else
+                {
+                    r++;
                 }
             }
 
-            int32_t n = l + r;
+            // Calculate the total number of neighbors, `n`
+            const int32_t n = l + r;
 
+            // Keep track of the particle that had the highest neighbor count
             if (n > n_max)
             {
                 n_max = n;
             }
 
-            // Change directions
-            const float delta_phi = params.alpha + n * params.beta * sign(r - l);
-            particles[i].phi += delta_phi;
-
-            // Calculate step direction + length
-            const float max_speed = 0.25f;
-            auto velocity = glm::normalize(particles[i].get_heading());
-            velocity *= max_speed * (n / static_cast<float>(particles.size()));// params.speed;
-            
-            // Clamp to window bounds
-            auto updated = particles[i].position + velocity;
-            updated = glm::clamp(updated, glm::vec2{ 0.0f }, glm::vec2{ 1.0f });
-
-            particles[i].position = updated;
-            particles[i].n = n;
+            particle.n = n;
+            particle.l = l;
+            particle.r = r;
         }
         
+        for (auto& particle : particles)
+        {
+            // Change directions
+            const float delta_phi = params.alpha + particle.n * params.beta * sign(particle.r - particle.l);
+            particle.phi += delta_phi;
+
+            // Calculate step direction + length
+            auto velocity = glm::normalize(particle.get_heading());
+            velocity *= params.speed * (particle.n / static_cast<float>(particles.size())); // 1.25f
+
+            // Clamp to window bounds
+            auto updated = particle.position + velocity;
+            updated = glm::clamp(updated, glm::vec2{ 0.0f }, glm::vec2{ window_w, window_h });
+
+            particle.position = updated;
+        }
+
         for (auto& particle : particles)
         {
             particle.n /= n_max;
         }
 
-        glNamedBufferSubData(vbo, 0, sizeof(Particle) * particles.size(), &particles[0]);
+        glNamedBufferSubData(vbo, 0, sizeof(Particle) * particles.size(), particles.data());
     }
 
     void draw() const
@@ -350,7 +494,14 @@ public:
 
 private:
 
+    int32_t k;
+    int32_t bin_size;
+    int32_t x_bins;
+    int32_t y_bins;
+    std::vector<std::vector<Particle*>> bins;
+
     Bounds bounds;
+    
     std::vector<Particle> particles;
     Params params;
     uint32_t vao;
@@ -414,6 +565,7 @@ int main()
     auto system = System{ bounds };
 
     auto shader_draw = graphics::Shader{ "../shaders/draw.vert", "../shaders/draw.frag" };
+    auto projection = glm::ortho(0.0f, static_cast<float>(window_w), 0.0f, static_cast<float>(window_h));
 
     while (!glfwWindowShouldClose(window))
     {
@@ -425,10 +577,15 @@ int main()
         ImGui::NewFrame();
         {
             ImGui::Begin("Primordial Particle System");
-            ImGui::SliderFloat("Alpha", &params.alpha, -glm::pi<float>() * 0.25f, glm::pi<float>() * 0.25f);
-            ImGui::SliderFloat("Beta", &params.beta, -glm::pi<float>() * 0.25f, glm::pi<float>() * 0.25f);
-            ImGui::SliderFloat("Radius", &params.radius, 0.001f, 0.2f);
-            ImGui::SliderFloat("Speed", &params.speed, 0.001f, 0.01f);
+            ImGui::SliderFloat("Alpha", &params.alpha, -0.5f, 0.5f);
+            ImGui::SliderFloat("Beta", &params.beta, -0.5f, 0.5f);
+            ImGui::SliderFloat("Radius", &params.radius, 5.0f, 50.0f);
+            ImGui::SliderFloat("Speed", &params.speed, 10.0f, 100.0f);
+            ImGui::SliderFloat("Draw Radius", &draw_radius, 1.0f, 20.0f);
+            if (ImGui::Button("Reset"))
+            {
+                system.reset();
+            }
             ImGui::ColorEdit3("clear color", (float*)&clear_color);
             ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
             ImGui::End();
@@ -441,13 +598,14 @@ int main()
 
         // Draw the particle system
         {
-            auto projection = glm::ortho(-0.5f, 1.5f, -0.5f, 1.5f);
+            
 
             system.set_params(params);
             system.update();
 
             shader_draw.use();
             shader_draw.uniform_float("u_time", glfwGetTime());
+            shader_draw.uniform_float("u_draw_radius", draw_radius);
             shader_draw.uniform_mat4("u_model", glm::mat4{ 1.0f });
             shader_draw.uniform_mat4("u_view", glm::mat4{ 1.0f });
             shader_draw.uniform_mat4("u_projection", projection);
@@ -457,7 +615,10 @@ int main()
 
         // Draw the ImGui window
         {
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            if (show_ui)
+            {
+                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            }
         }
 
         glfwSwapBuffers(window);
