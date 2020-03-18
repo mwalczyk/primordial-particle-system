@@ -248,7 +248,8 @@ public:
 
     System(const Bounds& bounds, int32_t k = 4) :
         bounds{ bounds },
-        k{ k }
+        k{ k },
+        points_per_particle_trail{ 10 }
     {
         reset();
 
@@ -286,6 +287,8 @@ public:
                 distribution(generator)
             });
         }
+
+        trail_cache.resize(particles.size() * points_per_particle_trail * 2);
     }
 
     void initialize()
@@ -396,8 +399,6 @@ public:
 
         for (auto& particle : particles)
         {
-            //auto bin_indices = glm::uvec2(particle.position) >> glm::uvec2{ k };
-
             const uint32_t x_bin = static_cast<uint32_t>(particle.position.x) >> k;
             const uint32_t y_bin = static_cast<uint32_t>(particle.position.y) >> k;
             const uint32_t bin_index = y_bin * x_bins + x_bin;
@@ -503,10 +504,15 @@ private:
     Bounds bounds;
     
     std::vector<Particle> particles;
+    std::vector<glm::vec2> trail_cache;
+    size_t points_per_particle_trail;
+
     Params params;
     uint32_t vao;
     uint32_t vbo;
 
+    uint32_t vao_trails;
+    uint32_t vbo_trails;
 };
 
 int main()
